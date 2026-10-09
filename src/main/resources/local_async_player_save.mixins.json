@@ -1,0 +1,1 @@
+{"required":true,"minVersion":"0.8.5","package":"local.asyncplayersave.mixin","compatibilityLevel":"JAVA_21","mixins":["ServerMixin","PlayerStorageMixin","ServerStorageAccessor","FtbBackupMixin"],"injectors":{"defaultRequire":1}}

@@ -1,0 +1,6 @@
+build/
+.worktrees/
+__pycache__/
+*.pyc
+*.log
+.env
