@@ -20,9 +20,9 @@ public final class AsyncPlayerSave {
  public static volatile boolean stopping;
  private static final ConcurrentLinkedQueue<Runnable> notifications=new ConcurrentLinkedQueue<>();
  public AsyncPlayerSave(IEventBus bus){
-  NeoForge.EVENT_BUS.addListener((ServerStartedEvent e)->{queue=new SaveQueue("async-player-save");stopping=false;if(Boolean.getBoolean("local.asyncplayersave.selftest"))IntegrationCheck.run(e.getServer());if(Boolean.getBoolean("local.asyncplayersave.ftbselftest"))FtbIntegrationCheck.run(e.getServer());if(Boolean.getBoolean("local.asyncplayersave.restoretest"))FtbIntegrationCheck.restore(e.getServer());LOG.info("Player autosave and FTB backup IO enabled for Minecraft 1.21.1; manual saves and shutdown use barriers");});
+  NeoForge.EVENT_BUS.addListener((ServerStartedEvent e)->{queue=new SaveQueue("async-player-save");stopping=false;if(Boolean.getBoolean("local.asyncplayersave.selftest"))IntegrationCheck.run(e.getServer());if(Boolean.getBoolean("local.asyncplayersave.ftbselftest"))FtbIntegrationCheck.run(e.getServer());if(Boolean.getBoolean("local.asyncplayersave.restoretest"))FtbIntegrationCheck.restore(e.getServer());if(Boolean.getBoolean("local.asyncplayersave.worldrestoretest"))WorldIntegrationCheck.restore(e.getServer());LOG.info("Player/world durable saves and FTB failure checkpoints enabled for Minecraft 1.21.1; manual saves and shutdown use barriers");});
   NeoForge.EVENT_BUS.addListener((ServerStoppingEvent e)->{beginShutdown();});
-  NeoForge.EVENT_BUS.addListener((ServerStoppedEvent e)->{try{flushWorld();SaveQueue q=queue;if(q!=null)q.close();}finally{queue=null;}});
+  NeoForge.EVENT_BUS.addListener((ServerStoppedEvent e)->{try{flushWorld();SaveQueue q=queue;if(q!=null)q.close();}finally{queue=null;WorldSaveCoordinator.reset();}});
  }
  public static boolean submit(Player player,File dir){
   SaveQueue q=queue;if(q==null||stopping||(!PERIODIC.get()&&!SaveContext.isBackup()))return false;
@@ -34,9 +34,9 @@ public final class AsyncPlayerSave {
   try{q.submit(id,()->{
    IOException failure=null;
    for(int attempt=0;attempt<3;attempt++)try{
-    AtomicSave.write(target,path->NbtIo.writeCompressed(tag,path));failure=null;break;
-   }catch(IOException e){failure=e;}
-   if(failure!=null){LOG.error("Player save failed after 3 attempts; previous file retained: {}",id,failure);throw failure;}
+    AtomicSave.write(target,path->NbtWrites.write(tag,path));failure=null;break;
+   }catch(IOException e){failure=e;if(e instanceof AtomicSave.PublicationException)break;}
+   if(failure!=null){LOG.error("Player save failed; durability not confirmed: {}",id,failure);throw failure;}
    // Preserve NeoForge save notification on the server thread, after the file is ready.
    notifications.add(()->EventHooks.firePlayerSavingEvent(player,dir,id));
   });return true;}
@@ -49,10 +49,11 @@ public final class AsyncPlayerSave {
  public static boolean isBackupCapture(){return SaveContext.isBackup();}
  public static CompletableFuture<Void> backupCheckpoint(MinecraftServer server){
   SaveQueue q=queue;
+  CompletableFuture<Void> worlds=WorldSaveCoordinator.checkpoint();
   CompletableFuture<Void> players=q==null?CompletableFuture.completedFuture(null):q.checkpoint();
   // Saving-event callbacks belong on the server thread, before the world marker.
   return players.thenCompose(ignored->server.submit(AsyncPlayerSave::drainNotifications))
-   .thenCompose(ignored->worldCheckpoint());
+   .thenCompose(ignored->worlds).thenCompose(ignored->worldCheckpoint());
  }
  private static CompletableFuture<Void> worldCheckpoint(){
   CompletableFuture<Void> done=new CompletableFuture<>();
@@ -62,7 +63,7 @@ public final class AsyncPlayerSave {
    executor.execute(()->done.complete(null));
   }catch(ClassNotFoundException e){done.complete(null);}
   catch(ReflectiveOperationException|RejectedExecutionException e){done.completeExceptionally(e);}
-  return done;
+  return CompletableFuture.allOf(done,WorldSaveCoordinator.checkpoint());
  }
  public static void flushWorld(){
   // Existing Fast Async World Save uses one FIFO queue. A marker waits for all earlier writes.
@@ -72,7 +73,8 @@ public final class AsyncPlayerSave {
    Future<?> marker=executor.submit(()->{});boolean interrupted=false;
    for(;;)try{marker.get();break;}catch(InterruptedException e){interrupted=true;}
    if(interrupted)Thread.currentThread().interrupt();
+   WorldSaveCoordinator.checkpoint().join();
   }catch(ClassNotFoundException e){/* Optional companion mod. */}
-  catch(ReflectiveOperationException|ExecutionException|RejectedExecutionException e){LOG.error("Could not drain Fast Async World Save queue",e);}
+  catch(ReflectiveOperationException|ExecutionException|RejectedExecutionException|CompletionException e){LOG.error("Could not drain Fast Async World Save queue",e);}
  }
 }

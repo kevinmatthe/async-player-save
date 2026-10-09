@@ -38,7 +38,7 @@ final class FtbIntegrationCheck {
      backup.get(30,TimeUnit.SECONDS);
      Path folder=Path.of("backups").toAbsolutePath();
      Path zip;
-     try(var files=Files.list(folder)){zip=files.filter(p->p.toString().endsWith(".zip")).max(java.util.Comparator.comparing(Path::toString)).orElseThrow();}
+     try(var files=Files.list(folder)){zip=files.filter(p->p.toString().endsWith(".zip")).max(java.util.Comparator.comparingLong(p->p.toFile().lastModified())).orElseThrow();}
      try(ZipFile archive=new ZipFile(zip.toFile())){
       var entry=archive.stream().filter(e->e.getName().endsWith("playerdata/"+player.getStringUUID()+".dat")).findFirst().orElseThrow();
       try(var input=archive.getInputStream(entry)){
@@ -69,6 +69,7 @@ final class FtbIntegrationCheck {
      if(!restored)throw new IllegalStateException("Failed backup did not terminate and restore saves");
      try(var files=Files.list(folder)){if(files.filter(p->p.toString().endsWith(".zip")).count()!=zipCount)throw new IllegalStateException("Failed IO still created a ZIP");}
      AsyncPlayerSave.LOG.info("FTB FAILURE PASS: injected player IO failure prevents ZIP creation and restores world saving");
+     if(Boolean.getBoolean("local.asyncplayersave.worldselftest"))WorldIntegrationCheck.run(server);
     }catch(Throwable e){AsyncPlayerSave.LOG.error("FTB INTEGRATION FAILED",e);}
    },"ftb-validation");verifier.setDaemon(true);verifier.start();
   }catch(Throwable e){AsyncPlayerSave.LOG.error("FTB INTEGRATION FAILED",e);}

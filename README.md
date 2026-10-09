@@ -1,35 +1,89 @@
-# Minecraft 1.21.1 玩家与 FTB 保存异步补丁
+# Minecraft Durable Async Saves
 
-版本 1.1.0。2026-10-09 12:35 已正常停服替换并在正式服启动；旧 JAR 与配置保存在 `build/rollback-20261009-1233/`。目标环境：Java 21、NeoForge 21.1.251、FTB Backups 2 1.0.28、Fast Async World Save 2.6。
+面向 Minecraft 1.21.1 / NeoForge 的服务端保存补丁。把玩家和世界 NBT 的磁盘等待移出主线程，让 FTB 在存档持久化完成后才开始打包，并将世界写入失败传递给备份流程。
 
-## 行为
+当前版本：**1.2.0**。保留原 mod ID `local_async_player_save` 和 JAR 命名前缀，升级时替换旧补丁，不同时安装两个版本。这个仓库只包含补丁、测试和说明，不包含 Minecraft、FAWS、FTB 的第三方 JAR 或真实世界数据。
 
-- 普通周期自动保存及 FTB 触发的保存：在服务器线程获取并复制玩家 NBT，后台单线程按顺序写文件。保留 NBT 的 SYNC 选项和 `.dat_old`。
-- FTB 保存提交返回的 future 同时包含捕获与后台写入完成。服务器线程不等待磁盘；FTB 自己的备份线程等待玩家写入、主线程保存事件通知和世界写入队列完成，再压缩。
-- 在服务器线程离开捕获阶段前取得玩家写入检查点，避免后续读取/手动保存消费失败结果。检查点无需额外队列容量，清理时不移除后续保存。
-- 玩家写入失败、捕获异常或备份捕获时队列满载会令 FTB 保存 future 失败；强制 FTB 检查已经完成的异常 future，避免跳过失败。备份捕获满载时中止备份，不在主线程等待磁盘。
-- 读取同一玩家、手动保存及关服仍有同步屏障；普通周期保存满载时保留原有等待并回退同步写入的行为。
-- FTB 的 JAR 不变，通过优化 JAR 的 Mixin 接入。FTB 可选依赖限制为 1.0.28；已安装但版本不符时拒绝启动，而不是静默使用错误调用点。
+## 我们解决的问题
 
-## 构建和验证
+整点 FTB 备份虽然在后台压缩 ZIP，前置保存仍可能让主线程等待磁盘。最初的玩家异步保存解决了普通自动保存；1.1.0 将 FTB 保存改为主线程捕获快照、备份线程等待完成。后续采样发现，后台保存仍有 10–24 秒的尾部耗时。
 
-执行 `python3 build.py`。使用当前 Minecraft 容器内的精确运行时依赖编译，产物为 `build/local-async-player-save-1.21.1-1.1.0.jar`，不会写入正式服 mods。
+原因之一是 Minecraft NBT 文件使用 `SYNC` 打开，gzip/缓冲输出的每段写入都要等待持久化。一次采样中，约 28KB 的 scoreboard.dat 分四次同步写入，累计 3.10 秒；14 个文件串行写入约 23.68 秒。我们同时观测到 SSD 镜像某个成员的 flush 延迟明显偏高，因此没有把全部延迟归因于软件。详细实验及测量边界见 [实验记录](docs/EXPERIMENTS.md)。
 
-Java 21 回归测试：`SaveQueueTest`、`AtomicSaveTest`、`BackupSaveTest`，覆盖顺序、非阻塞提交、读取屏障、原子替换、失败保留旧文件、备份 future、上下文恢复、满队列检查点、失败消费竞态和失败后的恢复。
+## 1.2.0 的保存流程
 
-独立完整模组测试服：容器 `/tmp/ftb-backup-validation-20261009`，独立世界和配置，监听容器回环地址端口 25585，BlueMap Web 服务禁用。只在隔离环境传入 `-Dlocal.asyncplayersave.selftest=true -Dlocal.asyncplayersave.ftbselftest=true`，通过真实 FTB 保存调用、FakePlayer 和人为阻塞 3 秒的世界 IO 验证 tick 继续、ZIP 新玩家数据、备份保存状态恢复和注入失败禁止压缩。`-Dlocal.asyncplayersave.restoretest=true` 校验从 ZIP 提取的新世界可启动并读取预期玩家数据。
+1. 主线程获取独立 NBT 快照。
+2. 后台以普通 buffered 输出写临时文件，完成 gzip。
+3. 每个完整临时文件执行一次 `FileChannel.force(true)`。
+4. 原子替换正式文件；玩家和 level.dat 保留 `.dat_old`。
+5. 同一批文件的父目录去重，每个目录同步一次。新目录在父目录中的名字也需要持久化。
+6. 完成 future 才成功，FTB 才能开始压缩。
 
-## 限制
+每个维度的 SavedData 是一批，level.dat 单独一批。世界任务使用 FAWS 原有单线程 FIFO executor；玩家使用独立的有界 FIFO 队列。区块 region 文件沿用现有实现。架构、线程关系、失败边界见 [架构说明](docs/ARCHITECTURE.md)。
 
-- **Fast Async World Save 2.6 自身会记录并吞掉部分世界写入错误。**本补丁的世界检查点保证此前任务已经执行结束，不能将其吞掉的错误转为 FTB 失败；不声称新增了完整的世界写入成功检测。
-- 沿用 FTB 1.0.28 的 30 秒等待超时及备份期间的保存开关。超时会中止备份并恢复保存；已经提交的后台 IO 不会因此被取消。
-- 不改变 FTB 对玩家退出或其他模组额外写入的现有一致性边界；主线程仍需要捕获 NBT、保存区块和执行保存事件，不保证保存完全无慢 tick。
-- 机器断电或强制结束进程仍会丢失未落盘的数据。正式服已验证一次无人在线的手动 FTB 备份；不能据此保证多人在线或后续整点保存无慢 tick。
+## 兼容性
 
-正式服应用需要正常停服后替换旧优化 JAR，再启动；不要同时保留 1.0.0 和 1.1.0。FTB 与 Fast Async World Save 原 JAR 保持不变。回退同样需正常停服后换回旧优化 JAR，不需要回滚世界。
+| 组件 | 已验证目标 |
+|---|---|
+| Java | 21 |
+| Minecraft | 1.21.1 |
+| NeoForge | 21.1.251 |
+| FTB Backups 2 | 1.0.28，可选；存在时严格限制版本 |
+| Fast Async World Save | 2.6，可选；存在时严格限制版本 |
 
-## 正式服验证与磁盘诊断（2026-10-09）
+FAWS 未安装时保留原版世界保存路径，世界集中持久化和世界失败跟踪不启用；玩家异步保存继续可用。FTB 未安装时不使用其接入点。其他范围内 NeoForge 版本尚未验证。补丁仅供服务端安装。
 
-12:38:24 触发真实 FTB 备份，12:39:13 完成，ZIP 1.2GB，读取归档 level.dat 校验通过，所有世界保存开关恢复。Spark 5ms Java 采样：服务器 saveEverything 路径约 35ms；FTB 后台等待保存约 8.8s。采样共 697 ticks，TPS 20，最大 tick 441.81ms，仍有较短慢 tick；没有此前约 8 秒的主线程保存等待。该次无人在线，玩家写入及失败路径依赖隔离测试。完整证据记录见 `build/manifest-1.1.0.json` 和正式服 `config/spark/profile-2026-10-09_12.39.00.sparkprofile`。
+## 构建
 
-将同一份 3754 字节 level.dat 内容在 SSD/HDD 数据集临时目录中各测试三次，回读校验后删除测试文件。三次中位耗时：普通写入 0.091/0.122ms、结尾 fsync 371.64/9.33ms、每次写入 O_SYNC 706.21/38.90ms（SSD/HDD）。普通写入返回不代表持久化。原始记录 `build/diagnostics-20261009/small-file-benchmark.json`。并行 40 秒 iostat：nvme1n1 平均 write/flush 93.03/191.03ms，nvme2n1 为 2.36/4.47ms。慢盘序列号 ZTA2512KA2251604ED，PCI 0000:07:00.0；另一盘 ZTA2512KA2251604E4。nvme1 同时存在较高 discard 延迟，尚未通过控制变量区分 TRIM、内部回收、固件或器件因素；没有改变 sync/autotrim，也没有写裸设备。
+需要 Python 3.11+、Java 21 JDK，以及目标服务器已经准备好的 Minecraft/NeoForge libraries。构建器编译源码，运行全部回归测试，打包资源；**不会安装到服务器 mods**。
+
+使用已有 Docker 服务器的依赖：
+
+```bash
+python3 build.py --container minecraft-crafty --server-dir /srv/minecraft
+```
+
+路径是容器内服务器目录。如果容器默认 Java 不是 21，用 `--java /path/to/jdk21/bin/java` 指定。构建器优先识别常见 Debian Java 21 路径，并验证实际版本。
+
+使用本地依赖和 JDK：
+
+```bash
+python3 build.py --libraries-dir ./dependencies/libraries --java /opt/jdk21/bin/java
+```
+
+也可使用 `MINECRAFT_CONTAINER`、`MINECRAFT_SERVER_DIR`、`MINECRAFT_LIBRARIES_DIR`、`JAVA21` 环境变量。容器构建使用独立临时目录并在结束后清理；优先使用映射后的 SRG JAR，避免加载未映射的同名服务器类。产物在 `build/local-async-player-save-1.21.1-1.2.0.jar`。
+
+## 安装与回退
+
+正常停服，保存当前补丁 JAR，删除 mods 中的旧补丁，放入新 JAR 后启动。FAWS、FTB 原 JAR 保持不变。不要热替换正在加载的模组。
+
+回退同样需要正常停服后换回旧补丁，存档格式保持原版 gzip/NBT，不需要回滚世界。回退会恢复旧版性能和失败处理边界。
+
+## 耗时与错误
+
+可选 JVM 参数：
+
+```text
+-Dlocal.asyncplayersave.logTimings=true
+```
+
+日志分别报告排队时间 `queueMs` 和后台完成持久化的时间 `ioMs`，包含文件 force、发布和目录 force。后台错误日志带目标路径和异常；不会通过跳过持久化确认来宣布成功。
+
+世界批次失败后，在主线程恢复 SavedData dirty，后续自动保存会重试。失败检查点持续有效，直到相应路径重新提交并成功；备份不能消费掉失败后把旧数据误判为已保存。发布前 IO 失败最多尝试三次；开始发布后的失败停止本次重试，避免覆盖刚保留的上一版。
+
+文件写入/force 在发布前失败时，正式文件保留旧版。发布后目录 force 失败，正式文件可能已经是新版，但持久化没有获得确认：仍报告失败。批量替换不是跨文件事务。完整限制见 [可靠性说明](docs/ARCHITECTURE.md#可靠性边界)。
+
+## 验证
+
+回归测试覆盖顺序、非阻塞提交、固定检查点、失败持续可见、按路径恢复、队列满、原子替换、文件/目录同步、备份旧版和故障清理。大块随机 NBT 测试确认完整 gzip 可以在 force 时读回，且只有一次文件 force 和一次目录 force。
+
+运行时验证必须使用独立世界和配置。`ftbselftest`、`worldselftest`、`restoretest`、`worldrestoretest` 等参数是隔离验证工具，**不要在正式世界启用**。测试会创建 FakePlayer、暂时阻塞 IO 队列、制造目标路径冲突并触发 FTB。使用方法和验收项见 [验证说明](docs/VALIDATION.md)。
+
+## 文档
+
+- [架构与失败边界](docs/ARCHITECTURE.md)
+- [实验记录与判断依据](docs/EXPERIMENTS.md)
+- [验证说明](docs/VALIDATION.md)
+- [版本变更](CHANGELOG.md)
+
+补丁代码使用 [MIT License](LICENSE)。第三方模组和 Minecraft 的许可分别适用。
